@@ -1,0 +1,423 @@
+import base64
+import hashlib
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+import requests
+
+from label_studio_sdk._extensions.label_studio_tools.core.utils.io import (
+    _DIR_APP_NAME,
+    get_base64_content,
+    get_local_path,
+    local_files_resolver,
+)
+
+
+def os_path_exists(url):
+    return False
+
+
+# List of test cases covering different storage options and URLs
+test_cases = [
+    # UI uploads
+    # NOTE: these normalize to the authenticated storage proxy URL:
+    # http://app.heartex.com/storage-data/uploaded/?filepath=upload/5/1.jpg
+    ("upload/5/1.jpg", f"test-data-dir/.cache/{_DIR_APP_NAME}/4988107b__1.jpg"),
+    ("/upload/5/1.jpg", f"test-data-dir/.cache/{_DIR_APP_NAME}/4988107b__1.jpg"),
+    ("/data/upload/5/1.jpg", f"test-data-dir/.cache/{_DIR_APP_NAME}/4988107b__1.jpg"),
+
+    # Local Storage
+    (
+        "/data/local-files?d=my_dir/1.jpg",
+        f"test-data-dir/.cache/{_DIR_APP_NAME}/3e01c002__1.jpg",
+    ),
+    (
+        "/data/local-files?d=my_dir/2.jpg",
+        f"test-data-dir/.cache/{_DIR_APP_NAME}/6ed75663__2.jpg",
+    ),
+    # Cloud Storages
+    (
+        "s3://bucket/prefix/1.jpg",
+        f"test-data-dir/.cache/{_DIR_APP_NAME}/d7390ac3__1.jpg",
+    ),
+    (
+        "gs://bucket/prefix/1.jpg",
+        f"test-data-dir/.cache/{_DIR_APP_NAME}/bbd2df49__1.jpg",
+    ),
+    (
+        "azure-blob://bucket/prefix/1.jpg",
+        f"test-data-dir/.cache/{_DIR_APP_NAME}/12a00348__1.jpg",
+    ),
+    # http(s) URLs
+    (
+        "http://example.com/1.jpg",
+        f"test-data-dir/.cache/{_DIR_APP_NAME}/52ede693__1.jpg",
+    ),
+]
+
+
+@pytest.mark.parametrize("url,expected", test_cases)
+@patch(
+    "label_studio_sdk._extensions.label_studio_tools.core.utils.io.get_data_dir",
+    return_value="test-data-dir/",
+)
+@patch(
+    "label_studio_sdk._extensions.label_studio_tools.core.utils.io.get_cache_dir",
+    return_value=f"test-data-dir/.cache/{_DIR_APP_NAME}",
+)
+def test_get_local_path(mock_get_data_dir, mock_get_cache_dir, url, expected):
+    with patch("os.path.exists") as mock_exists:
+        mock_exists.side_effect = os_path_exists
+
+        x = get_local_path(
+            url,
+            access_token="secret",
+            hostname="http://app.heartex.com",
+            download_resources=False,
+            task_id=1,
+        )
+        print("\n ==> get_local_path = ", x)
+        assert x == expected
+
+
+@pytest.mark.parametrize(
+    "url, raises_error",
+    [
+        # Valid local file
+        ("/data/local-files?d=my_dir/1.jpg", False),
+        # Attempted directory traversal
+        ("/data/local-files?d=../../etc/passwd", True),
+    ],
+)
+@patch("label_studio_sdk._extensions.label_studio_tools.core.utils.io.get_data_dir", return_value="test-data-dir/")
+@patch("label_studio_sdk._extensions.label_studio_tools.core.utils.io.get_cache_dir", return_value="test-data-dir/.cache/label-studio")
+@patch("label_studio_sdk._extensions.label_studio_tools.core.utils.io.LOCAL_FILES_DOCUMENT_ROOT", "/my_files")
+def test_get_local_path_safe_build(mock_data_dir, mock_cache_dir, url, raises_error):
+    # Mock file-existence checks so the call proceeds to path-building logic
+    with patch("os.path.exists", return_value=True):
+        if raises_error:
+            with pytest.raises(ValueError, match="Invalid path"):
+                result = get_local_path(url, access_token="secret", hostname="http://app.heartex.com")
+        else:
+            local_path = get_local_path(url, access_token="secret", hostname="http://app.heartex.com")
+            assert "my_dir/1.jpg" in local_path
+
+
+@patch("label_studio_sdk._extensions.label_studio_tools.core.utils.io.LOCAL_FILES_DOCUMENT_ROOT", "")
+def test_get_local_path_local_storage_downloads_to_cache(tmp_path):
+    """Ensure local storage files are copied into cache when download_resources is enabled."""
+    local_root = tmp_path / "local-storage-root"
+    image_dir = local_root / "my_dir"
+    image_dir.mkdir(parents=True)
+    source_file = image_dir / "1.jpg"
+    source_content = b"local-image-bytes"
+    source_file.write_bytes(source_content)
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    local_url = "/data/local-files?d=my_dir/1.jpg"
+
+    with patch(
+        "label_studio_sdk._extensions.label_studio_tools.core.utils.io.LOCAL_FILES_DOCUMENT_ROOT", str(local_root)
+    ):
+        cached_path = get_local_path(
+            url=local_url,
+            cache_dir=str(cache_dir),
+            hostname="http://app.heartex.com",
+            access_token="secret",
+            download_resources=True,
+            task_id=1,
+        )
+
+    expected_hash = hashlib.md5(local_url.encode(), usedforsecurity=False).hexdigest()[:8]
+    expected_path = cache_dir / f"{expected_hash}__1.jpg"
+
+    assert cached_path == str(expected_path)
+    assert expected_path.exists()
+    assert expected_path.read_bytes() == source_content
+
+
+def test_get_local_path_storage_proxy_filename_and_auth(monkeypatch, tmp_path):
+    """
+    Ensure storage proxy URLs use `filepath` for filename, rewrite to hostname,
+    and attach auth for matching host.
+    """
+    url = "/storage-data/uploaded/?filepath=upload/5/1.jpg"
+    hostname = "https://labelstudio.example.com"
+    token = "secret"
+    cache_dir = tmp_path
+
+    requested = SimpleNamespace(url=None, headers=None)
+
+    def fake_get(u, stream=False, headers=None, verify=None):
+        requested.url = u
+        requested.headers = headers or {}
+        response = MagicMock()
+        response.content = b"imgdata"
+        response.raise_for_status = lambda: None
+        return response
+
+    monkeypatch.setattr("label_studio_sdk._extensions.label_studio_tools.core.utils.io.requests.get", fake_get)
+
+    local_path = get_local_path(
+        url=url,
+        cache_dir=str(cache_dir),
+        hostname=hostname,
+        access_token=token,
+        download_resources=True,
+        task_id=123,
+    )
+
+    # filename should come from filepath and keep extension
+    url_hash = hashlib.md5(f"{hostname}{url}".encode(), usedforsecurity=False).hexdigest()[:8]
+    assert local_path.endswith(f"{url_hash}__1.jpg")
+
+    # ensure request url was rewritten to hostname
+    assert requested.url.startswith(f"{hostname}/storage-data/uploaded/?filepath=upload/5/1.jpg")
+    # ensure auth header is attached
+    assert "Authorization" in requested.headers
+    assert requested.headers["Authorization"] in (f"Token {token}", f"Bearer {token}")
+
+
+def test_get_base64_content_storage_proxy_rewrite(monkeypatch):
+    url = "/storage-data/uploaded/?filepath=upload/5/1.jpg"
+    hostname = "https://labelstudio.example.com"
+    token = "secret"
+
+    requested = SimpleNamespace(url=None, headers=None)
+
+    def fake_get(u, headers=None, verify=None):
+        requested.url = u
+        requested.headers = headers or {}
+        response = MagicMock()
+        response.content = b"abc"
+        response.raise_for_status = lambda: None
+        return response
+
+    monkeypatch.setattr("label_studio_sdk._extensions.label_studio_tools.core.utils.io.requests.get", fake_get)
+
+    content_b64 = get_base64_content(
+        url=url,
+        hostname=hostname,
+        access_token=token,
+        task_id=123,
+    )
+
+    assert content_b64 == base64.b64encode(b"abc").decode("utf-8")
+    assert requested.url.startswith(f"{hostname}/storage-data/uploaded/?filepath=upload/5/1.jpg")
+    assert "Authorization" in requested.headers
+    assert requested.headers["Authorization"] in (f"Token {token}", f"Bearer {token}")
+
+
+def test_get_local_path_upload_is_rewritten_to_storage_proxy(monkeypatch, tmp_path):
+    """Ensure raw upload keys are rewritten to /storage-data/uploaded for downloads.
+
+    This specifically covers the rewrite block in io.get_local_path:
+    - normalizes upload/<project>/<file> to /data/upload/...
+    - then rewrites to /storage-data/uploaded/?filepath=upload/<project>/<file>
+    """
+
+    url = "upload/5/1.jpg"
+    hostname = "https://labelstudio.example.com"
+    token = "secret"
+
+    requested = SimpleNamespace(url=None, headers=None)
+
+    def fake_get(u, stream=False, headers=None, verify=None):
+        requested.url = u
+        requested.headers = headers or {}
+        response = MagicMock()
+        response.content = b"imgdata"
+        response.raise_for_status = lambda: None
+        return response
+
+    monkeypatch.setattr(
+        "label_studio_sdk._extensions.label_studio_tools.core.utils.io.requests.get",
+        fake_get,
+    )
+
+    local_path = get_local_path(
+        url=url,
+        cache_dir=str(tmp_path),
+        hostname=hostname,
+        access_token=token,
+        download_resources=True,
+        task_id=123,
+    )
+
+    expected_full_url = f"{hostname}/storage-data/uploaded/?filepath=upload/5/1.jpg"
+    expected_hash = hashlib.md5(expected_full_url.encode(), usedforsecurity=False).hexdigest()[:8]
+    assert local_path.endswith(f"{expected_hash}__1.jpg")
+
+    assert requested.url == expected_full_url
+    assert "Authorization" in requested.headers
+    assert requested.headers["Authorization"] in (f"Token {token}", f"Bearer {token}")
+    assert "/data/upload/" not in requested.url
+
+
+def test_get_local_path_upload_proxy_fallback_to_data_upload(monkeypatch, tmp_path):
+    """
+    If storage proxy download fails (e.g., FileSystemStorage with nginx), fallback to /data/upload works.
+    """
+    url = "upload/5/1.jpg"
+    hostname = "http://app.heartex.com"
+    token = "secret"
+
+    calls = []
+
+    def fake_get(u, stream=False, headers=None, verify=None):
+        calls.append(u)
+        # First call to proxy -> 401
+        if "storage-data/uploaded" in u:
+            raise requests.exceptions.HTTPError("401")
+        # Second call to data/upload succeeds
+        resp = MagicMock()
+        resp.content = b"imgdata"
+        resp.raise_for_status = lambda: None
+        return resp
+
+    monkeypatch.setattr("label_studio_sdk._extensions.label_studio_tools.core.utils.io.requests.get", fake_get)
+    with patch("os.path.exists", return_value=False):
+        local_path = get_local_path(
+            url=url,
+            cache_dir=str(tmp_path),
+            hostname=hostname,
+            access_token=token,
+            download_resources=True,
+            task_id=123,
+        )
+
+    fallback_url = f"{hostname}/data/upload/5/1.jpg"
+    expected_hash = hashlib.md5(fallback_url.encode(), usedforsecurity=False).hexdigest()[:8]
+    assert local_path.endswith(f"{expected_hash}__1.jpg")
+    assert calls[0].startswith(f"{hostname}/storage-data/uploaded/?filepath=upload/5/1.jpg")
+    assert calls[-1] == fallback_url
+
+
+def test_get_base64_content_fallback(monkeypatch):
+    """
+    If storage proxy download fails, get_base64_content should fallback to /data/upload.
+    """
+    url = "/storage-data/uploaded/?filepath=upload/5/1.jpg"
+    hostname = "http://app.heartex.com"
+    token = "secret"
+
+    calls = []
+
+    def fake_get(u, headers=None, verify=None):
+        calls.append(u)
+        if "storage-data/uploaded" in u:
+            raise requests.exceptions.HTTPError("401")
+        resp = MagicMock()
+        resp.content = b"abc"
+        resp.raise_for_status = lambda: None
+        return resp
+
+    monkeypatch.setattr("label_studio_sdk._extensions.label_studio_tools.core.utils.io.requests.get", fake_get)
+
+    content_b64 = get_base64_content(
+        url=url,
+        hostname=hostname,
+        access_token=token,
+        task_id=123,
+    )
+
+    fallback_url = f"{hostname}/data/upload/5/1.jpg"
+    assert content_b64 == base64.b64encode(b"abc").decode("utf-8")
+    assert calls[0].startswith(f"{hostname}/storage-data/uploaded/?filepath=upload/5/1.jpg")
+    assert calls[-1] == fallback_url
+
+
+
+
+_IO = "label_studio_sdk._extensions.label_studio_tools.core.utils.io"
+
+
+@pytest.mark.parametrize("root", [None, "", "/"])
+def test_get_local_path_local_storage_needs_explicit_root(monkeypatch, tmp_path, root):
+    """Without a real document root the file must not be read from disk, only requested from Label Studio."""
+    monkeypatch.delenv("LABEL_STUDIO_URL", raising=False)
+    monkeypatch.delenv("LABEL_STUDIO_HOST", raising=False)
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"secret")
+
+    with patch(f"{_IO}.LOCAL_FILES_DOCUMENT_ROOT", root):
+        with pytest.raises(FileNotFoundError, match="Can.t resolve url"):
+            get_local_path(f"/data/local-files/?d={secret}", cache_dir=str(tmp_path / "cache"))
+
+
+def test_get_local_path_local_storage_absolute_d_stays_under_root(tmp_path):
+    root = tmp_path / "root"
+    (root / "etc").mkdir(parents=True)
+    (root / "etc" / "file.txt").write_bytes(b"inside")
+
+    with patch(f"{_IO}.LOCAL_FILES_DOCUMENT_ROOT", str(root)):
+        local_path = get_local_path("/data/local-files/?d=/etc/file.txt", download_resources=False)
+
+    assert local_path == str(root / "etc" / "file.txt")
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ("d=my%20dir/1.jpg", "my dir/1.jpg"),
+        # Trailing params stay out of the path
+        ("d=my_dir/1.jpg&foo=bar", "my_dir/1.jpg"),
+        # Decoded once: a literal "%41" in the file name must not become "A"
+        ("d=my_dir/a%2541.jpg", "my_dir/a%41.jpg"),
+        # Same as request.GET.get("d") in the /data/local-files/ view
+        ("d=first.jpg&d=last.jpg", "last.jpg"),
+    ],
+)
+def test_get_local_path_local_storage_parses_d_like_the_view(tmp_path, query, expected):
+    source = tmp_path / "1.jpg"
+    source.write_bytes(b"image")
+    requested = []
+
+    def resolver(relative_path):
+        requested.append(relative_path)
+        return str(source)
+
+    with local_files_resolver(resolver):
+        local_path = get_local_path(f"/data/local-files/?{query}", download_resources=False)
+
+    assert local_path == str(source)
+    assert requested == [expected]
+
+
+def test_get_local_path_local_storage_without_path(tmp_path):
+    def resolver(relative_path):
+        raise AssertionError("an empty ?d= must not reach the resolver")
+
+    with local_files_resolver(resolver):
+        with pytest.raises(FileNotFoundError, match="no file path"):
+            get_local_path("/data/local-files/?d=", download_resources=False)
+
+
+def test_get_local_path_local_storage_denied_by_resolver_is_not_downloaded(monkeypatch, tmp_path):
+    def fail_get(*args, **kwargs):
+        raise AssertionError("a denied Local Storage file must not be fetched over HTTP")
+
+    monkeypatch.setattr(f"{_IO}.requests.get", fail_get)
+
+    with local_files_resolver(lambda relative_path: None):
+        with pytest.raises(FileNotFoundError, match="not available"):
+            get_local_path(
+                "/data/local-files/?d=etc/passwd",
+                cache_dir=str(tmp_path),
+                hostname="http://app.heartex.com",
+                access_token="secret",
+                download_resources=True,
+            )
+
+
+def test_get_local_path_upload_rejects_non_numeric_project(monkeypatch, tmp_path):
+    monkeypatch.delenv("LABEL_STUDIO_URL", raising=False)
+    monkeypatch.delenv("LABEL_STUDIO_HOST", raising=False)
+    image_dir = tmp_path / "upload"
+    image_dir.mkdir()
+    (tmp_path / "secret.txt").write_bytes(b"secret")
+
+    with pytest.raises(FileNotFoundError, match="Can.t resolve url"):
+        get_local_path("/data/upload/../secret.txt", image_dir=str(image_dir))

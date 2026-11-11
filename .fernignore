@@ -1,0 +1,47 @@
+# Specify files that shouldn't be modified by Fern
+
+# PyPI / GitHub project readme (in the monorepo this file is also reachable as
+# libs/label-studio-sdk/README.md via the workspace symlink).
+README.md
+LICENSE
+CONTRIBUTING.md
+
+# manual extensions, use generators.yml to include specific top-level imports from here
+# this directory also includes legacy label_studio_tools/ package and the Typer CLI
+src/label_studio_sdk/_extensions
+src/label_studio_sdk/label_interface
+src/label_studio_sdk/client.py
+src/label_studio_sdk/tasks/client_ext.py
+src/label_studio_sdk/projects/client_ext.py
+src/label_studio_sdk/projects/exports/client_ext.py
+src/label_studio_sdk/tokens/client_ext.py
+src/label_studio_sdk/core/client_wrapper.py
+
+# converter
+src/label_studio_sdk/converter
+
+# manually added types not yet in the API spec
+src/label_studio_sdk/types/mode_enum.py
+
+# legacy code - to be removed in the future
+src/label_studio_sdk/_legacy
+src/label_studio_sdk/data_manager.py
+
+# tutorials and examples
+tutorials
+examples
+interface-cli.md
+
+# tests
+tests/custom/converter
+tests/custom/label_studio_tools
+tests/custom/legacy
+tests/custom/test_interface
+tests/custom/cli
+tests/custom/test_client_wrapper.py
+tests/custom/test_tokens_client_ext.py
+tests/custom/test_tasks_create_many_status_alias.py
+
+# CI config is owned by the label-studio-sdk repo: copybara (sdk-push) never
+# syncs .github/**, and this entry keeps fern from generating its own copy here.
+.github
